@@ -2458,5 +2458,270 @@ html[data-theme="dark"] .pchip.rm{background:#4a1f1b;color:#ffb4aa}`;
   };
 })();
 </script>
+<script>
+(function () {
+  'use strict';
+  const BUCKET = 'chat-media', MAX = 300;
+  const TYPES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'];
+  const ve = (t, c, x) => { const e = document.createElement(t); if (c) e.className = c; if (x != null) e.textContent = x; return e; };
+  const mmss = s => { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+  const durOf = m => { const x = String(m.body || '').match(/(\d+):(\d{2})\s*$/); return x ? +x[1] * 60 + +x[2] : 0; };
+
+  const css = ve('style');
+  css.textContent = `
+#text:placeholder-shown~#sendBtn{display:none}
+#text:not(:placeholder-shown)~#micBtn{display:none}
+#micBtn{font-size:20px}
+#recBar{display:none;flex:1;min-width:0;gap:12px;align-items:stretch;min-height:50px}
+#composer.recording>:not(#recBar){display:none!important}
+#composer.recording #recBar{display:flex}
+#recBar>.recDot,#recBar>#recTime,#recBar>#recNote{align-self:center}
+.recDot{flex:none;width:12px;height:12px;border-radius:50%;background:#e5484d;animation:vnPulse 1.2s ease-in-out infinite}
+#recBar[data-mode="sending"] .recDot,#recBar[data-mode="ready"] .recDot{animation:none;opacity:.5}
+@keyframes vnPulse{50%{opacity:.3;transform:scale(.8)}}
+#recTime{font-weight:600;font-variant-numeric:tabular-nums;min-width:40px}
+.recMeter{flex:1;min-width:0;display:flex;align-items:center;justify-content:flex-end;gap:2px;overflow:hidden}
+.recMeter i{flex:none;width:3px;height:4px;border-radius:2px;background:#9cc7f5}
+html[data-theme="light"] .recMeter i{background:#1f6f5c}
+#recNote{display:none;flex:1;font-size:14px;color:#e5736f}
+html[data-theme="light"] #recNote{color:#c0392b}
+#recBar[data-mode="ready"] .recMeter{display:none}
+#recBar[data-mode="ready"] #recNote{display:block}
+.msg.x-voice{min-width:240px;padding:8px 12px 6px}
+.vn{display:flex;align-items:center;gap:10px;--vn-btn:#1f6f5c;--vn-fg:#fff}
+.msg.me .vn{--vn-btn:#121a33;--vn-fg:#fff}
+.msg.cast .vn{--vn-btn:#fff;--vn-fg:#1f6f5c}
+html[data-theme="dark"] .msg.them .vn{--vn-btn:#9cc7f5;--vn-fg:#121a33}
+.vnPlay{flex:none;width:40px;height:40px;border-radius:50%;border:0;background:var(--vn-btn);color:var(--vn-fg);font-size:16px;display:grid;place-items:center}
+.vnMid{flex:1;min-width:0}
+.vnSeek{display:block;width:100%;height:18px;margin:0;accent-color:var(--vn-btn)}
+.vnTime{font-size:12px;opacity:.75;font-variant-numeric:tabular-nums}
+.vnSpd{flex:none;border:1px solid currentColor;background:none;color:inherit;border-radius:999px;font-size:12px;font-weight:700;padding:2px 8px;opacity:.8}`;
+  document.head.appendChild(css);
+
+  /* ---------- playback ---------- */
+  const urls = new Map();
+  let rate = [1, 1.5, 2].includes(+store.get('nook-vn-rate')) ? +store.get('nook-vn-rate') : 1, playing = null;
+
+  async function signed(path) {
+    const h = urls.get(path); if (h && h.t > Date.now()) return h.u;
+    const { data, error } = await nookDb.storage.from(BUCKET).createSignedUrl(path, 3600);
+    if (error) throw error;
+    urls.set(path, { u: data.signedUrl, t: Date.now() + 3300e3 });
+    return data.signedUrl;
+  }
+  /* WebM from MediaRecorder reports an infinite length until it is seeked to the end once */
+  function prime(au, url) {
+    return new Promise(res => {
+      let done = false;
+      const fin = () => { if (done) return; done = true; clearTimeout(tm); au.removeEventListener('timeupdate', back); res(); };
+      const back = () => { au.currentTime = 0; fin(); };
+      const tm = setTimeout(() => { try { au.currentTime = 0; } catch (e) {} fin(); }, 4000);
+      au.addEventListener('error', fin, { once: true });
+      au.addEventListener('loadedmetadata', () => {
+        if (isFinite(au.duration)) return fin();
+        au.addEventListener('timeupdate', back); au.currentTime = 1e101;
+      }, { once: true });
+      au.src = url;
+    });
+  }
+
+  function voiceEl(m) {
+    const total = durOf(m), box = ve('div', 'vn'), mid = ve('div', 'vnMid');
+    const btn = ve('button', 'vnPlay', '▶'), seek = ve('input', 'vnSeek'), time = ve('span', 'vnTime'), spd = ve('button', 'vnSpd', rate + '×');
+    btn.type = spd.type = 'button'; seek.type = 'range'; seek.min = 0; seek.max = 1000; seek.value = 0;
+    btn.setAttribute('aria-label', 'Play voice note'); seek.setAttribute('aria-label', 'Seek'); spd.setAttribute('aria-label', 'Playback speed');
+    mid.append(seek, time); box.append(btn, mid, spd);
+    box.addEventListener('click', e => e.stopPropagation());   // don't open the react/reply bar
+    let a = null, ready = null, scrub = false;
+    const dur = () => (a && isFinite(a.duration) && a.duration > 0 ? a.duration : total);
+    const paint = () => {
+      const d = dur(), t = a ? a.currentTime : 0;
+      if (!scrub) seek.value = d ? Math.min(1000, Math.round(t / d * 1000)) : 0;
+      time.textContent = mmss(t) + ' / ' + mmss(d);
+    };
+    const icon = on => { btn.textContent = on ? '⏸' : '▶'; btn.setAttribute('aria-label', on ? 'Pause voice note' : 'Play voice note'); };
+    const ctl = { pause() { if (a) a.pause(); }, rate() { if (a) a.playbackRate = rate; } };
+    function load() {
+      if (!ready) ready = (async () => {
+        const au = new Audio(); au.preload = 'auto';
+        au.addEventListener('timeupdate', paint);
+        au.addEventListener('play', () => icon(true));
+        au.addEventListener('pause', () => icon(false));
+        au.addEventListener('error', () => icon(false));
+        au.addEventListener('ended', () => { au.currentTime = 0; icon(false); paint(); if (playing === ctl) playing = null; });
+        await prime(au, await signed(m.file_path));
+        return (a = au);
+      })().catch(e => { ready = null; throw e; });
+      return ready;
+    }
+    btn.onclick = async () => {
+      try {
+        const au = await load();
+        if (!au.paused) return au.pause();
+        if (playing && playing !== ctl) playing.pause();
+        playing = ctl; au.playbackRate = rate; await au.play();
+      } catch (e) {
+        if (!e || e.name !== 'AbortError') { a = ready = null; icon(false); toast('Could not play this voice note'); }
+      }
+    };
+    seek.oninput = () => { scrub = true; time.textContent = mmss(seek.value / 1000 * dur()) + ' / ' + mmss(dur()); };
+    seek.onchange = async () => {
+      scrub = false;
+      try { const au = await load(); au.currentTime = seek.value / 1000 * dur(); paint(); } catch (e) { toast('Could not load this voice note'); }
+    };
+    spd.onclick = () => {
+      rate = rate === 1 ? 1.5 : rate === 1.5 ? 2 : 1; store.set('nook-vn-rate', String(rate));
+      document.querySelectorAll('.vnSpd').forEach(b => { b.textContent = rate + '×'; });
+      if (playing) playing.rate();
+    };
+    paint();
+    return box;
+  }
+
+  /* draw the player inside the normal message bubble */
+  const _add = window.addBubble;
+  window.addBubble = function (c, m) {
+    if (m.kind !== 'voice') return _add(c, m);
+    const ob = m.body; m.body = ''; m.kind = 'text';
+    try { _add(c, m); } finally { m.body = ob; m.kind = 'voice'; }
+    const e = $('msgs').querySelector('[data-id="' + m.id + '"]'); if (!e) return;
+    e.classList.add('x-voice');
+    e.insertBefore(m.file_path ? voiceEl(m) : ve('div', '', 'Voice note unavailable'), e.querySelector('small'));
+  };
+
+  /* ---------- recording ---------- */
+  const comp = $('composer'), mic = ve('button', 'tool', '🎙️'), bar = ve('div'), BARS = 48, lv = new Array(BARS).fill(0), bars = [];
+  mic.type = 'button'; mic.id = 'micBtn'; mic.title = 'Record voice note'; mic.setAttribute('aria-label', 'Record voice note');
+  $('sendBtn').before(mic);   // mic shows while the box is empty, Send shows once you type
+  bar.id = 'recBar'; bar.dataset.mode = 'recording';
+  bar.innerHTML = '<button type="button" class="tool" id="vnCancel" aria-label="Discard voice note" title="Discard">🗑️</button>' +
+    '<span class="recDot"></span><span id="recTime" role="timer">0:00</span><div class="recMeter" id="recMeter" aria-hidden="true"></div>' +
+    '<span id="recNote">Not sent. Tap Send to try again.</span><button type="button" class="send" id="vnSend">Send</button>';
+  comp.appendChild(bar);
+  for (let i = 0; i < BARS; i++) { const b = document.createElement('i'); $('recMeter').appendChild(b); bars.push(b); }
+  let vn = null;
+
+  const micError = e => {
+    const n = e && e.name;
+    return n === 'NotAllowedError' || n === 'SecurityError' ? 'Allow microphone access in your browser, then try again'
+      : n === 'NotFoundError' ? 'No microphone found'
+      : n === 'NotReadableError' ? 'Your microphone is being used by another app'
+      : 'Could not start recording';
+  };
+  function setMode(mode) {
+    bar.dataset.mode = mode;
+    const busy = mode === 'sending';
+    $('vnSend').disabled = $('vnCancel').disabled = busy;
+    $('vnSend').textContent = busy ? 'Sending…' : 'Send';
+  }
+  function release(s) {
+    clearInterval(s.tick); s.stream.getTracks().forEach(t => t.stop());
+    try { s.actx && s.actx.close(); } catch (e) {}
+  }
+  function end(s) { release(s); if (vn === s) vn = null; comp.classList.remove('recording'); }
+  const stopRec = s => new Promise(res => {
+    if (s.rec.state === 'inactive') return res();
+    s.rec.addEventListener('stop', () => res(), { once: true });
+    try { s.rec.stop(); } catch (e) { res(); }
+  });
+
+  async function start() {
+    const c = active;
+    if (vn || !c || !canPost(c)) return;
+    if (!window.MediaRecorder || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return toast('Voice notes need a modern browser on an https:// page');
+    mic.disabled = true;
+    let stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
+    catch (e) { mic.disabled = false; return toast(micError(e)); }
+    mic.disabled = false;
+    if (vn || active !== c) return stream.getTracks().forEach(t => t.stop());   // switched chats while the permission prompt was open
+    const type = TYPES.find(t => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t));
+    let rec;
+    try { rec = type ? new MediaRecorder(stream, { mimeType: type }) : new MediaRecorder(stream); }
+    catch (e) { stream.getTracks().forEach(t => t.stop()); return toast('Could not start recording'); }
+    const mime = (rec.mimeType || type || 'audio/webm').split(';')[0], ext = /mp4|aac/.test(mime) ? 'm4a' : /ogg/.test(mime) ? 'ogg' : 'webm';
+    const s = vn = { c, stream, rec, mime, ext, chunks: [], t0: Date.now(), secs: 0, state: 'recording', blob: null, tick: 0, actx: null };
+    rec.ondataavailable = e => { if (e.data && e.data.size) s.chunks.push(e.data); };
+    rec.onerror = () => cancel('Recording failed');
+    let an = null, buf = null;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      s.actx = new AC(); an = s.actx.createAnalyser(); an.fftSize = 512;
+      s.actx.createMediaStreamSource(stream).connect(an); buf = new Uint8Array(an.fftSize); s.actx.resume();
+    } catch (e) { an = null; }
+    lv.fill(0); bars.forEach(b => { b.style.height = '4px'; });
+    rec.start(1000); setMode('recording'); $('recTime').textContent = '0:00'; comp.classList.add('recording');
+    s.tick = setInterval(() => {
+      if (s.state !== 'recording') return;
+      if (active !== c) return cancel('Voice note discarded');
+      const secs = (Date.now() - s.t0) / 1000;
+      $('recTime').textContent = mmss(secs);
+      let l = 0;
+      if (an) { an.getByteTimeDomainData(buf); let q = 0; for (let i = 0; i < buf.length; i++) { const x = (buf[i] - 128) / 128; q += x * x; } l = Math.sqrt(q / buf.length); }
+      lv.push(Math.min(1, l * 4)); lv.shift();
+      bars.forEach((b, i) => { b.style.height = (4 + lv[i] * 24) + 'px'; });
+      if (secs >= MAX) { toast('5-minute limit reached. Sending your voice note.'); send(); }
+    }, 80);
+  }
+
+  function cancel(msg) {
+    const s = vn; if (!s || s.state === 'sending') return;
+    s.rec.ondataavailable = s.rec.onerror = null;
+    try { if (s.rec.state !== 'inactive') s.rec.stop(); } catch (e) {}
+    end(s); if (typeof msg === 'string') toast(msg);
+  }
+
+  async function upload(s) {
+    const c = s.c, name = 'voice-note.' + s.ext, path = c.id + '/' + crypto.randomUUID() + '-' + name;
+    const up = await nookDb.storage.from(BUCKET).upload(path, s.blob, { contentType: s.mime });
+    if (up.error) { toast('Upload failed: ' + up.error.message); return false; }
+    const row = { conversation_id: c.id, sender_id: me.id, kind: 'voice', body: '🎤 Voice note · ' + mmss(s.secs),
+                  file_path: path, file_name: name, file_type: s.mime, file_size: s.blob.size };
+    if (replyTo && active === c) row.reply_to = replyTo.id;
+    const { data, error } = await nookDb.from('messages').insert(row).select().single();
+    if (error) { nookDb.storage.from(BUCKET).remove([path]); toast('Not sent: ' + error.message); return false; }
+    if (active === c) clearReply();
+    handleMessage(data);
+    return true;
+  }
+
+  async function send() {
+    const s = vn; if (!s || s.state === 'sending') return;
+    const wasRec = s.state === 'recording';
+    s.state = 'sending'; setMode('sending');
+    if (wasRec) {
+      s.secs = Math.round((Date.now() - s.t0) / 1000);
+      await stopRec(s); release(s);
+      s.blob = new Blob(s.chunks, { type: s.mime });
+      if (s.secs < 1 || !s.blob.size) { end(s); return toast('Voice note too short. Keep recording a little longer.'); }
+      $('recTime').textContent = mmss(s.secs);
+    }
+    const ok = await upload(s);
+    if (ok) end(s); else { s.state = 'ready'; setMode('ready'); }   // keep the recording so Send can retry
+  }
+
+  mic.onclick = start;
+  $('vnCancel').onclick = () => cancel();
+  $('vnSend').onclick = send;
+
+  /* ---------- housekeeping ---------- */
+  const _oc = window.openChat;
+  window.openChat = async function (c) {
+    if (playing) { playing.pause(); playing = null; }
+    if (vn && vn.c !== c && vn.state !== 'sending') cancel('Voice note discarded');
+    return _oc(c);
+  };
+  const _del = window.deleteMessage;
+  window.deleteMessage = async function (m) {
+    await _del(m);
+    if (m.kind !== 'voice' || !m.file_path) return;
+    const c = byId[m.conversation_id];
+    if (c && c.msgs.some(x => x.id === m.id)) return;   // still there: delete was cancelled or failed
+    try { await nookDb.storage.from(BUCKET).remove([m.file_path]); } catch (e) {}
+  };
+})();
+</script>
+
 </body>
 </html>
