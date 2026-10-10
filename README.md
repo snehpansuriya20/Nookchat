@@ -47,7 +47,9 @@ mainhackathon/
 
 4. Explore the website and its available features.
 
-**Note:** If the application requires a backend or database, configure and start those services before using features that depend on them.
+or 
+
+just start from deployment link
 
 ## 🎯 Project Objective
 
